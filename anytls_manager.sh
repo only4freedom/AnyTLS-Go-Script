@@ -1,14 +1,12 @@
 #!/bin/bash
 
 # =========================================================
-# AnyTLS-Go 服务端一键管理脚本 (官方源修正版)
-# 适配版本: v0.0.12
-# 仓库地址: https://github.com/anytls/anytls-go
+# AnyTLS-Go 服务端一键管理脚本 (v0.0.12 修正版)
+# 修复: 下载链接格式、Zip解压逻辑
 # =========================================================
 
 # --- 全局配置 ---
 ANYTLS_VERSION="0.0.12"
-# 修正为官方仓库地址
 DOWNLOAD_BASE_URL="https://github.com/anytls/anytls-go/releases/download"
 
 # 路径配置
@@ -20,6 +18,7 @@ CERT_FILE="${CONFIG_DIR}/server.crt"
 KEY_FILE="${CONFIG_DIR}/server.key"
 SERVICE_NAME="anytls"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+TEMP_DIR="/tmp/anytls_install"
 
 # 颜色定义
 RED="\033[31m"
@@ -37,7 +36,8 @@ check_root() {
 }
 
 check_deps() {
-    local deps=("wget" "openssl" "curl" "qrencode")
+    # 既然是zip包，必须安装 unzip
+    local deps=("wget" "openssl" "curl" "qrencode" "unzip")
     local need_install=()
 
     for dep in "${deps[@]}"; do
@@ -78,7 +78,7 @@ do_install() {
     check_root
     check_deps
 
-    echo -e "${GREEN}>>> 开始安装 AnyTLS v${ANYTLS_VERSION} (官方源)...${PLAIN}"
+    echo -e "${GREEN}>>> 开始安装 AnyTLS v${ANYTLS_VERSION}...${PLAIN}"
 
     # 1. 架构检测
     ARCH=$(uname -m)
@@ -95,33 +95,45 @@ do_install() {
     read -p "请输入连接密码 [留空随机]: " PASSWORD
     [[ -z "${PASSWORD}" ]] && PASSWORD=$(openssl rand -base64 16)
 
-    # 3. 下载文件
-    # 注意: v0.0.12 官方Release通常直接提供二进制文件: anytls-go-linux-amd64
-    # 如果下载失败，可能是官方改回了 .tar.gz 格式，这里优先尝试二进制
-    DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/anytls-go-linux-${DOWNLOAD_ARCH}"
+    # 3. 下载文件 (修复为 zip 格式)
+    # 格式: anytls_0.0.12_linux_amd64.zip
+    FILENAME="anytls_${ANYTLS_VERSION}_linux_${DOWNLOAD_ARCH}.zip"
+    DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/${FILENAME}"
     
-    echo -e "${YELLOW}正在下载核心文件: ${DOWNLOAD_URL}${PLAIN}"
-    rm -f "${SERVER_BINARY_PATH}" # 清理旧文件
+    echo -e "${YELLOW}正在下载: ${DOWNLOAD_URL}${PLAIN}"
     
-    wget -O "${SERVER_BINARY_PATH}" "${DOWNLOAD_URL}"
+    mkdir -p "${TEMP_DIR}"
+    rm -f "${TEMP_DIR}/${FILENAME}"
+    
+    wget -O "${TEMP_DIR}/${FILENAME}" "${DOWNLOAD_URL}"
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}下载失败！${PLAIN}"
-        echo -e "${YELLOW}尝试下载 tar.gz 格式...${PLAIN}"
-        # 备用方案：如果官方发布的是 tar.gz 包
-        wget -O "/tmp/anytls.tar.gz" "${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/anytls-go_${ANYTLS_VERSION}_linux_${DOWNLOAD_ARCH}.tar.gz"
-        if [ $? -eq 0 ]; then
-             tar -zxvf "/tmp/anytls.tar.gz" -C "/tmp/" anytls-go
-             mv "/tmp/anytls-go" "${SERVER_BINARY_PATH}"
-             rm "/tmp/anytls.tar.gz"
-        else
-             echo -e "${RED}无法下载文件，请检查 GitHub 连接或版本号。${PLAIN}"
-             exit 1
-        fi
+        echo -e "${RED}下载失败！请检查网络。${PLAIN}"
+        rm -rf "${TEMP_DIR}"
+        exit 1
     fi
-    
+
+    echo -e "${YELLOW}正在解压...${PLAIN}"
+    unzip -o "${TEMP_DIR}/${FILENAME}" -d "${TEMP_DIR}" >/dev/null
+
+    # 查找解压后的 anytls-server 二进制文件
+    # 有时候解压出来可能在子目录，这里进行查找
+    EXTRACTED_BIN=$(find "${TEMP_DIR}" -type f -name "anytls-server" | head -n 1)
+
+    if [[ -z "${EXTRACTED_BIN}" ]]; then
+        echo -e "${RED}错误: 解压后未找到 'anytls-server' 文件。${PLAIN}"
+        ls -R "${TEMP_DIR}" # 调试用：列出文件结构
+        rm -rf "${TEMP_DIR}"
+        exit 1
+    fi
+
+    # 停止旧服务并移动新文件
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null
+    mv "${EXTRACTED_BIN}" "${SERVER_BINARY_PATH}"
     chmod +x "${SERVER_BINARY_PATH}"
-    echo -e "${GREEN}核心文件安装成功。${PLAIN}"
+    rm -rf "${TEMP_DIR}"
+
+    echo -e "${GREEN}AnyTLS 核心安装成功。${PLAIN}"
 
     # 4. 生成证书 (v0.0.12 必需)
     mkdir -p "${CONFIG_DIR}"
@@ -141,7 +153,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-# v0.0.12 必须指定证书 (-c) 和私钥 (-k)
+# 启动参数: 端口(-l), 密码(-p), 证书(-c), 私钥(-k)
 ExecStart=${SERVER_BINARY_PATH} -l :${PORT} -p "${PASSWORD}" -c ${CERT_FILE} -k ${KEY_FILE}
 Restart=on-failure
 RestartSec=5s
@@ -161,8 +173,7 @@ EOF
         show_info "${PORT}" "${PASSWORD}"
     else
         echo -e "${RED}服务启动失败！${PLAIN}"
-        echo -e "请运行以下命令查看详细错误日志："
-        echo -e "${YELLOW}journalctl -u ${SERVICE_NAME} -n 20 --no-pager${PLAIN}"
+        echo -e "请运行: journalctl -u ${SERVICE_NAME} -n 20 --no-pager 查看原因"
     fi
 }
 
@@ -174,7 +185,7 @@ do_uninstall() {
     rm -f "${SERVICE_FILE}"
     rm -f "${SERVER_BINARY_PATH}"
     systemctl daemon-reload
-    echo -e "${GREEN}卸载完成。(配置文件保留在 ${CONFIG_DIR})${PLAIN}"
+    echo -e "${GREEN}卸载完成 (保留了配置文件 ${CONFIG_DIR})${PLAIN}"
 }
 
 show_info() {
@@ -192,7 +203,7 @@ show_info() {
     fi
 
     local ip=$(get_public_ip)
-    # v0.0.12 标准链接格式 anytls://密码@IP:端口
+    # v0.0.12 标准链接
     local link="anytls://${password}@${ip}:${port}"
     local link_remarks="${link}#AnyTLS_${port}"
 
@@ -203,28 +214,26 @@ show_info() {
     echo -e " IP地址 : ${GREEN}${ip}${PLAIN}"
     echo -e " 端口   : ${GREEN}${port}${PLAIN}"
     echo -e " 密码   : ${GREEN}${password}${PLAIN}"
-    echo -e " 证书   : ${CERT_FILE} (自签)"
+    echo -e " 证书   : ${CERT_FILE}"
     echo -e "========================================"
-    echo -e " 客户端配置链接 (复制):"
+    echo -e " 客户端链接 (复制):"
     echo -e " ${YELLOW}${link}${PLAIN}"
     echo -e "========================================"
-    echo -e " 二维码 (Shadowrocket / NekoBox):"
+    echo -e " 二维码:"
     qrencode -t ANSIUTF8 "${link_remarks}"
     echo -e ""
 }
 
-# --- 菜单管理 ---
-
 show_menu() {
-    echo -e "AnyTLS-Go 管理脚本 (Official Repo)"
+    echo -e "AnyTLS-Go 管理脚本 (v${ANYTLS_VERSION})"
     echo "--------------------------------"
-    echo -e "1. 安装 / 更新 AnyTLS (v${ANYTLS_VERSION})"
-    echo -e "2. 卸载 AnyTLS"
+    echo -e "1. 安装 / 更新"
+    echo -e "2. 卸载"
     echo -e "3. 启动服务"
     echo -e "4. 停止服务"
     echo -e "5. 重启服务"
     echo -e "6. 查看配置与二维码"
-    echo -e "7. 查看运行日志"
+    echo -e "7. 查看日志"
     echo "--------------------------------"
     echo -e "0. 退出"
     echo ""
@@ -242,8 +251,6 @@ show_menu() {
         *) echo -e "${RED}无效选项${PLAIN}" ;;
     esac
 }
-
-# --- 入口 ---
 
 if [[ $# > 0 ]]; then
     case $1 in
