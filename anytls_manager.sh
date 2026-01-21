@@ -1,418 +1,252 @@
 #!/bin/bash
 
-# AnyTLS-Go 服务端一键管理脚本
-# 版本: v0.0.8 (基于 anytls/anytls-go)
+# =========================================================
+# AnyTLS-Go 服务端一键管理脚本 (适配 v0.0.12+)
+# 功能: 安装/卸载/管理/二维码/自签证书自动配置
+# =========================================================
 
-# --- 全局配置参数 ---
-ANYTLS_VERSION="v0.0.8"
-BASE_URL="https://github.com/anytls/anytls-go/releases/download"
-INSTALL_DIR_TEMP="/tmp/anytls_install_$$" # 使用 $$ 增加随机性
+# --- 全局配置 ---
+# 注意: 请确保此版本号在 GitHub Releases 中存在
+ANYTLS_VERSION="0.0.12" 
+# 项目发布地址 (根据实际情况调整，默认使用 zimolab 或官方源)
+DOWNLOAD_BASE_URL="https://github.com/zimolab/anytls-go/releases/download"
+
+# 路径配置
 BIN_DIR="/usr/local/bin"
 SERVER_BINARY_NAME="anytls-server"
 SERVER_BINARY_PATH="${BIN_DIR}/${SERVER_BINARY_NAME}"
-SERVICE_FILE_BASENAME="anytls-server.service"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_FILE_BASENAME}"
+CONFIG_DIR="/etc/anytls"
+CERT_FILE="${CONFIG_DIR}/server.crt"
+KEY_FILE="${CONFIG_DIR}/server.key"
+SERVICE_NAME="anytls"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# --- 工具函数 ---
+# 颜色定义
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+PLAIN="\033[0m"
 
-# 检查命令是否存在
-check_command() {
-  command -v "$1" >/dev/null 2>&1
-}
+# --- 核心工具函数 ---
 
-# 安装必要的软件包
-install_packages() {
-  local packages_to_install=("$@")
-  if [ ${#packages_to_install[@]} -eq 0 ]; then
-    return 0
-  fi
-  echo "正在尝试安装必要的软件包: ${packages_to_install[*]}"
-  if check_command apt-get; then
-    apt-get update -qq && apt-get install -y -qq "${packages_to_install[@]}"
-  elif check_command yum; then
-    yum install -y -q "${packages_to_install[@]}"
-  elif check_command dnf; then
-    dnf install -y -q "${packages_to_install[@]}"
-  else
-    echo "错误：无法确定系统的包管理器。请手动安装: ${packages_to_install[*]}"
-    return 1
-  fi
-  for pkg in "${packages_to_install[@]}"; do
-    if ! check_command "$pkg"; then
-      echo "错误：软件包 $pkg 安装失败。"
-      return 1
-    fi
-  done
-  echo "软件包 ${packages_to_install[*]} 安装成功。"
-  return 0
-}
-
-# URL 编码函数
-urlencode() {
-    local string="${1}"
-    local strlen=${#string}
-    local encoded=""
-    local pos c o
-    for (( pos=0 ; pos<strlen ; pos++ )); do
-       c=${string:$pos:1}
-       case "$c" in
-          [-_.~a-zA-Z0-9] ) o="${c}" ;;
-          * )               printf -v o '%%%02x' "'$c"
-       esac
-       encoded+="${o}"
-    done
-    echo "${encoded}"
-}
-
-# 获取公网 IP 地址
-get_public_ip() {
-  echo "正在尝试获取服务器公网IP地址..." >&2 # Output to stderr
-  local IP_CANDIDATES=()
-  IP_CANDIDATES+=("$(curl -s --max-time 8 --ipv4 https://api.ipify.org)")
-  IP_CANDIDATES+=("$(curl -s --max-time 8 --ipv4 https://ipinfo.io/ip)")
-  IP_CANDIDATES+=("$(curl -s --max-time 8 --ipv4 https://checkip.amazonaws.com)")
-  IP_CANDIDATES+=("$(curl -s --max-time 8 --ipv4 https://icanhazip.com)")
-  
-  local valid_ip=""
-  for ip_candidate in "${IP_CANDIDATES[@]}"; do
-    if [[ "$ip_candidate" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-      if ! [[ "$ip_candidate" =~ ^10\. ]] && \
-         ! [[ "$ip_candidate" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && \
-         ! [[ "$ip_candidate" =~ ^192\.168\. ]] && \
-         ! [[ "$ip_candidate" =~ ^127\. ]]; then
-        valid_ip="$ip_candidate"
-        break
-      fi
-    fi
-  done
-
-  if [ -n "$valid_ip" ]; then
-    echo "$valid_ip"
-    return 0
-  else
-    local local_ips
-    local_ips=$(hostname -I 2>/dev/null)
-    if [ -n "$local_ips" ]; then
-        for ip_candidate in $local_ips; do
-             if [[ "$ip_candidate" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-                if ! [[ "$ip_candidate" =~ ^10\. ]] && \
-                   ! [[ "$ip_candidate" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && \
-                   ! [[ "$ip_candidate" =~ ^192\.168\. ]] && \
-                   ! [[ "$ip_candidate" =~ ^127\. ]]; then
-                    echo "$ip_candidate"
-                    echo "警告: 上述IP地址通过 'hostname -I' 获取，请确认其为公网IP。" >&2
-                    return 0
-                fi
-            fi
-        done
-    fi
-    echo "" # Return empty if no IP found
-    return 1
-  fi
-}
-
-# 清理临时文件
-cleanup_temp() {
-  if [ -d "$INSTALL_DIR_TEMP" ]; then
-    echo "正在清理临时安装目录: $INSTALL_DIR_TEMP..." >&2
-    rm -rf "$INSTALL_DIR_TEMP"
-  fi
-}
-trap cleanup_temp EXIT SIGINT SIGTERM # Ensure cleanup on exit
-
-# 检查root权限
-require_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "错误：此操作 '$1' 需要 root 权限。请使用 'sudo $0 $1' 再次尝试。"
+# 检查是否为 Root
+check_root() {
+    if [ $EUID -ne 0 ]; then
+        echo -e "${RED}错误: 请使用 sudo 或 root 用户运行此脚本！${PLAIN}"
         exit 1
     fi
 }
 
-# --- 服务管理与安装卸载函数 ---
+# 检查命令依赖
+check_deps() {
+    local deps=("wget" "openssl" "curl" "qrencode")
+    local need_install=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            need_install+=("$dep")
+        fi
+    done
+
+    if [ ${#need_install[@]} -gt 0 ]; then
+        echo -e "${YELLOW}正在安装依赖: ${need_install[*]} ...${PLAIN}"
+        if [ -x "$(command -v apt)" ]; then
+            apt update -qq && apt install -y -qq "${need_install[@]}"
+        elif [ -x "$(command -v yum)" ]; then
+            yum install -y -q "${need_install[@]}"
+        elif [ -x "$(command -v dnf)" ]; then
+            dnf install -y -q "${need_install[@]}"
+        else
+            echo -e "${RED}无法自动安装依赖，请手动安装: ${need_install[*]}${PLAIN}"
+            exit 1
+        fi
+    fi
+}
+
+# 获取公网 IP (多接口容错)
+get_public_ip() {
+    local ip=$(curl -s4m5 https://api.ipify.org)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s4m5 https://ipinfo.io/ip)
+    fi
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s4m5 https://ifconfig.me)
+    fi
+    echo "$ip"
+}
+
+# --- 功能函数 ---
 
 do_install() {
-    require_root "install"
-    echo "开始安装/更新 AnyTLS-Go 服务 (目标版本: ${ANYTLS_VERSION})..."
-    echo "=================================================="
+    check_root
+    check_deps
 
-    read -r -p "请输入 AnyTLS 服务端监听端口 (默认 8443): " ANYTLS_PORT
-    ANYTLS_PORT=${ANYTLS_PORT:-8443}
-    if ! [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] || [ "$ANYTLS_PORT" -lt 1 ] || [ "$ANYTLS_PORT" -gt 65535 ]; then
-        echo "错误：端口号 \"$ANYTLS_PORT\" 无效。"
-        exit 1
-    fi
+    echo -e "${GREEN}>>> 开始安装 AnyTLS v${ANYTLS_VERSION}...${PLAIN}"
 
-    local ANYTLS_PASSWORD ANYTLS_PASSWORD_CONFIRM
-    while true; do
-      read -r -s -p "请输入 AnyTLS 服务端密码 (必须填写): " ANYTLS_PASSWORD
-      echo
-      if [ -z "$ANYTLS_PASSWORD" ]; then echo "错误：密码不能为空，请重新输入。"; continue; fi
-      read -r -s -p "请再次输入密码以确认: " ANYTLS_PASSWORD_CONFIRM
-      echo
-      if [ "$ANYTLS_PASSWORD" == "$ANYTLS_PASSWORD_CONFIRM" ]; then break; else echo "两次输入的密码不一致，请重新输入。"; fi
-    done
-
-    local deps_to_install=()
-    if ! check_command wget; then deps_to_install+=("wget"); fi
-    if ! check_command unzip; then deps_to_install+=("unzip"); fi
-    if ! check_command curl; then deps_to_install+=("curl"); fi
-    if ! check_command qrencode; then deps_to_install+=("qrencode"); fi
-    if ! install_packages "${deps_to_install[@]}"; then echo "依赖安装失败，无法继续。"; exit 1; fi
-
-    local ARCH_RAW ANYTLS_ARCH
-    ARCH_RAW=$(uname -m)
-    case $ARCH_RAW in
-      x86_64 | amd64) ANYTLS_ARCH="amd64" ;;
-      aarch64 | arm64) ANYTLS_ARCH="arm64" ;;
-      *) echo "错误: 不支持的系统架构 ($ARCH_RAW)。"; exit 1 ;;
+    # 1. 架构检测
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64|amd64) DOWNLOAD_ARCH="amd64" ;;
+        aarch64|arm64) DOWNLOAD_ARCH="arm64" ;;
+        *) echo -e "${RED}不支持的架构: $ARCH${PLAIN}"; exit 1 ;;
     esac
-    echo "检测到系统架构: $ANYTLS_ARCH"
 
-    local VERSION_FOR_FILENAME FILENAME DOWNLOAD_URL
-    VERSION_FOR_FILENAME=${ANYTLS_VERSION#v}
-    FILENAME="anytls_${VERSION_FOR_FILENAME}_linux_${ANYTLS_ARCH}.zip"
-    DOWNLOAD_URL="${BASE_URL}/${ANYTLS_VERSION}/${FILENAME}"
+    # 2. 用户配置
+    read -p "请输入监听端口 [默认 443]: " PORT
+    [[ -z "${PORT}" ]] && PORT="443"
 
-    mkdir -p "$INSTALL_DIR_TEMP"
-    echo "正在从 $DOWNLOAD_URL 下载 AnyTLS-Go..."
-    if ! wget -q -O "${INSTALL_DIR_TEMP}/${FILENAME}" "$DOWNLOAD_URL"; then
-      echo "错误: 下载 AnyTLS-Go 失败。"; exit 1
-    fi
+    read -p "请输入连接密码 [留空随机]: " PASSWORD
+    [[ -z "${PASSWORD}" ]] && PASSWORD=$(openssl rand -base64 16)
 
-    echo "正在解压文件到 $INSTALL_DIR_TEMP ..."
-    if ! unzip -q -o "${INSTALL_DIR_TEMP}/${FILENAME}" -d "$INSTALL_DIR_TEMP"; then
-      echo "错误: 解压 AnyTLS-Go 失败。"; exit 1
-    fi
-    if [ ! -f "${INSTALL_DIR_TEMP}/${SERVER_BINARY_NAME}" ]; then
-        echo "错误: 解压后未找到 ${SERVER_BINARY_NAME}。"; exit 1
-    fi
+    # 3. 下载文件 (v0.0.12 通常是单二进制文件)
+    # URL 格式示例: anytls-go-linux-amd64
+    DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/anytls-go-linux-${DOWNLOAD_ARCH}"
+    
+    echo -e "${YELLOW}正在下载核心文件...${PLAIN}"
+    rm -f "${SERVER_BINARY_PATH}" # 清理旧文件
+    wget -O "${SERVER_BINARY_PATH}" "${DOWNLOAD_URL}"
 
-    echo "正在安装服务端程序到 ${SERVER_BINARY_PATH} ..."
-    if systemctl is-active --quiet "${SERVICE_FILE_BASENAME}"; then # Stop service before replacing binary
-        systemctl stop "${SERVICE_FILE_BASENAME}"
-    fi
-    if ! mv "${INSTALL_DIR_TEMP}/${SERVER_BINARY_NAME}" "${SERVER_BINARY_PATH}"; then
-      echo "错误: 移动 ${SERVER_BINARY_NAME} 失败。"; exit 1
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}下载失败！请检查网络或版本号。${PLAIN}"
+        exit 1
     fi
     chmod +x "${SERVER_BINARY_PATH}"
 
-    echo "正在创建/更新 systemd 服务文件: ${SERVICE_FILE} ..."
-    cat > "$SERVICE_FILE" << EOF
+    # 4. 生成证书 (v0.0.12 必需)
+    mkdir -p "${CONFIG_DIR}"
+    if [[ ! -f "${CERT_FILE}" ]]; then
+        echo -e "${YELLOW}正在生成自签名证书...${PLAIN}"
+        # 生成有效期 10 年的自签证书，CN 设为常见域名混淆
+        openssl req -newkey rsa:2048 -nodes -keyout "${KEY_FILE}" -x509 -days 3650 -out "${CERT_FILE}" -subj "/CN=www.microsoft.com" 2>/dev/null
+    else
+        echo -e "${GREEN}检测到已有证书，保留原配置。${PLAIN}"
+    fi
+
+    # 5. 配置 Systemd
+    cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=AnyTLS Server Service (Version ${ANYTLS_VERSION})
-Documentation=https://github.com/anytls/anytls-go
-After=network.target network-online.target
-Wants=network-online.target
+Description=AnyTLS Server (v${ANYTLS_VERSION})
+After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=${SERVER_BINARY_PATH} -l 0.0.0.0:${ANYTLS_PORT} -p "${ANYTLS_PASSWORD}"
+# 关键改动: 增加 -c 和 -k 参数加载证书
+ExecStart=${SERVER_BINARY_PATH} -l :${PORT} -p "${PASSWORD}" -c ${CERT_FILE} -k ${KEY_FILE}
 Restart=on-failure
-RestartSec=10s
-LimitNOFILE=65535
-StandardOutput=journal
-StandardError=journal
+RestartSec=5s
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    echo "正在重载 systemd 配置并启动 AnyTLS 服务..."
+    # 6. 启动服务
     systemctl daemon-reload
-    if ! systemctl enable "${SERVICE_FILE_BASENAME}"; then echo "错误：设置开机自启失败。"; exit 1; fi
-    if ! systemctl restart "${SERVICE_FILE_BASENAME}"; then # Use restart to ensure it starts fresh
-        echo "错误：启动/重启 AnyTLS 服务失败。请检查日志。"; status_service; log_service -n 20; exit 1;
-    fi
-    
+    systemctl enable "${SERVICE_NAME}"
+    systemctl restart "${SERVICE_NAME}"
+
     sleep 2
-    if systemctl is-active --quiet "${SERVICE_FILE_BASENAME}"; then
-        echo ""
-        echo "🎉 AnyTLS 服务已成功安装/更新并启动！🎉"
-        local SERVER_IP
-        SERVER_IP=$(get_public_ip)
-        generate_and_display_qr_codes "${SERVER_IP}" "${ANYTLS_PORT}" "${ANYTLS_PASSWORD}" "install"
-        display_manage_commands
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        show_info "${PORT}" "${PASSWORD}"
     else
-        echo "错误: AnyTLS 服务未能成功启动。"; status_service; log_service -n 20;
+        echo -e "${RED}服务启动失败！请运行 'journalctl -u ${SERVICE_NAME} -n 20' 查看日志。${PLAIN}"
     fi
 }
 
 do_uninstall() {
-    require_root "uninstall"
-    echo "正在卸载 AnyTLS-Go 服务..."
-    if systemctl list-unit-files | grep -q "${SERVICE_FILE_BASENAME}"; then
-        systemctl stop "${SERVICE_FILE_BASENAME}"
-        systemctl disable "${SERVICE_FILE_BASENAME}"
-        rm -f "${SERVICE_FILE}"
-        echo "Systemd 服务文件 ${SERVICE_FILE} 已移除。"
-        systemctl daemon-reload
-        systemctl reset-failed # Important for cleaning up failed state
-        echo "Systemd 配置已重载。"
-    else
-        echo "未找到 AnyTLS-Go Systemd 服务。"
-    fi
-
-    if [ -f "${SERVER_BINARY_PATH}" ]; then
-        rm -f "${SERVER_BINARY_PATH}"
-        echo "服务端程序 ${SERVER_BINARY_PATH} 已移除。"
-    else
-        echo "未找到服务端程序 ${SERVER_BINARY_PATH}。"
-    fi
-    # Consider removing /etc/anytls-server if config files were stored there. Not in this script.
-    echo "AnyTLS-Go 服务卸载完成。"
+    check_root
+    echo -e "${YELLOW}正在卸载 AnyTLS...${PLAIN}"
+    systemctl stop "${SERVICE_NAME}"
+    systemctl disable "${SERVICE_NAME}"
+    rm -f "${SERVICE_FILE}"
+    rm -f "${SERVER_BINARY_PATH}"
+    # 可选：询问是否保留配置文件
+    # rm -rf "${CONFIG_DIR}" 
+    systemctl daemon-reload
+    echo -e "${GREEN}卸载完成。${PLAIN}"
 }
 
-start_service() { require_root "start"; echo "正在启动 AnyTLS 服务..."; systemctl start "${SERVICE_FILE_BASENAME}"; sleep 1; status_service; }
-stop_service() { require_root "stop"; echo "正在停止 AnyTLS 服务..."; systemctl stop "${SERVICE_FILE_BASENAME}"; sleep 1; status_service; }
-restart_service() { require_root "restart"; echo "正在重启 AnyTLS 服务..."; systemctl restart "${SERVICE_FILE_BASENAME}"; sleep 1; status_service; }
-status_service() { echo "AnyTLS 服务状态:"; systemctl status "${SERVICE_FILE_BASENAME}" --no-pager; }
-log_service() { echo "显示 AnyTLS 服务日志 (按 Ctrl+C 退出):"; journalctl -u "${SERVICE_FILE_BASENAME}" -f "$@"; }
-
-generate_and_display_qr_codes() {
-    local server_ip="$1"
-    local server_port="$2"
-    local server_password="$3"
-    local source_action="$4" # "install" or "qr"
-
-    if [ -z "$server_ip" ] || [ "$server_ip" == "YOUR_SERVER_IP" ]; then # YOUR_SERVER_IP is a placeholder
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo "!! 警告: 未能自动获取到服务器的公网 IP 地址。            !!"
-        if [ "$source_action" == "install" ]; then
-            echo "!! 二维码和分享链接中的IP将为空。请手动填写。              !!"
-        else # qr action
-            echo "!! 请手动获取公网IP并在客户端配置。                      !!"
+show_info() {
+    local port=$1
+    local password=$2
+    
+    # 如果没传参数，尝试从运行中的进程或配置里读 (简化处理，若未传则提示手动查看)
+    if [[ -z "$port" ]]; then
+        # 尝试从 systemd 文件解析
+        if [[ -f "$SERVICE_FILE" ]]; then
+            port=$(grep -oP ' -l :\K\d+' "$SERVICE_FILE")
+            # 提取引号内的密码
+            password=$(grep -oP ' -p "\K[^"]+' "$SERVICE_FILE")
+        else
+            echo -e "${RED}未找到安装配置。${PLAIN}"
+            return
         fi
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        if [ "$source_action" == "qr" ] && [ "$server_ip" == "YOUR_SERVER_IP" ]; then return 1; fi # Abort QR if IP is placeholder from qr action
-        server_ip="YOUR_SERVER_IP" # Use placeholder for URI if install
-    fi
-    
-    echo "-----------------------------------------------"
-    echo "【客户端配置信息】"
-    echo "  服务器地址  : ${server_ip}"
-    echo "  服务器端口  : ${server_port}"
-    echo "  密码        : ${server_password}"
-    echo "  协议        : AnyTLS"
-    echo "  注意        : anytls-go 使用自签名证书, 客户端需启用 '允许不安全' 或 '跳过证书验证'。"
-    echo "-----------------------------------------------"
-
-    if ! check_command qrencode; then
-        echo "警告: 未找到 qrencode 命令，无法生成二维码。"
-        echo "请尝试运行 'sudo $0 install' (会自动安装qrencode) 或手动安装 (如: sudo apt install qrencode)。"
-        return 1
-    fi
-    
-    local ENCODED_PASSWORD REMARKS NEKOBOX_URI SHADOWROCKET_URI
-    ENCODED_PASSWORD=$(urlencode "${server_password}")
-    REMARKS=$(urlencode "AnyTLS-${server_port}")
-
-    NEKOBOX_URI="anytls://${ENCODED_PASSWORD}@${server_ip}:${server_port}?allowInsecure=true#${REMARKS}"
-    echo ""
-    echo "【NekoBox 配置链接】:"
-    echo "${NEKOBOX_URI}"
-    echo "【NekoBox 二维码】 (请确保终端支持UTF-8且有足够空间显示):"
-    qrencode -t ANSIUTF8 -m 1 "${NEKOBOX_URI}"
-    echo "-----------------------------------------------"
-
-    SHADOWROCKET_URI="anytls://${ENCODED_PASSWORD}@${server_ip}:${server_port}#${REMARKS}"
-    echo ""
-    echo "【Shadowrocket 配置链接】:"
-    echo "${SHADOWROCKET_URI}"
-    echo "【Shadowrocket 二维码】 (请确保终端支持UTF-8且有足够空间显示):"
-    qrencode -t ANSIUTF8 -m 1 "${SHADOWROCKET_URI}"
-    echo "提醒: Shadowrocket用户扫描后，请在节点的TLS设置中手动开启“允许不安全”。"
-    echo "-----------------------------------------------"
-    return 0
-}
-
-show_qr_codes_interactive() {
-    echo "重新生成配置二维码..."
-    if [ ! -f "${SERVICE_FILE}" ]; then
-        echo "错误: AnyTLS 服务似乎尚未安装 (未找到 ${SERVICE_FILE})。"
-        echo "请先运行 'sudo $0 install'。"
-        exit 1
     fi
 
-    local deps_to_install_qr=()
-    if ! check_command qrencode; then deps_to_install_qr+=("qrencode"); fi
-    if ! check_command curl; then deps_to_install_qr+=("curl"); fi # For get_public_ip
-    if ! install_packages "${deps_to_install_qr[@]}"; then echo "依赖安装失败，无法继续。"; exit 1; fi
+    local ip=$(get_public_ip)
+    # v0.0.12 标准链接格式
+    local link="anytls://${password}@${ip}:${port}"
+    # 兼容 Shadowrocket/NekoBox 的备注
+    local link_remarks="${link}#AnyTLS_${port}"
 
-    local SAVED_PORT password_for_qr server_ip_for_qr
-    SAVED_PORT=$(grep -Po 'ExecStart=.*-l 0\.0\.0\.0:\K[0-9]+' "${SERVICE_FILE}" 2>/dev/null)
-    if [ -z "$SAVED_PORT" ]; then
-        echo "警告: 无法从服务文件中自动读取端口号。"
-        read -r -p "请输入 AnyTLS 服务端当前配置的端口: " SAVED_PORT
-        if ! [[ "$SAVED_PORT" =~ ^[0-9]+$ ]]; then echo "端口号无效。"; exit 1; fi
-    else
-        echo "从服务配置中读取到端口: ${SAVED_PORT}"
-    fi
-    
-    read -r -s -p "请输入您为 AnyTLS 服务设置的密码: " password_for_qr; echo
-    if [ -z "$password_for_qr" ]; then echo "密码不能为空。"; exit 1; fi
-
-    server_ip_for_qr=$(get_public_ip)
-    # generate_and_display_qr_codes will handle empty IP with a placeholder
-    
-    generate_and_display_qr_codes "${server_ip_for_qr}" "${SAVED_PORT}" "${password_for_qr}" "qr"
+    echo -e ""
+    echo -e "========================================"
+    echo -e "       AnyTLS v${ANYTLS_VERSION} 配置信息"
+    echo -e "========================================"
+    echo -e " IP地址 : ${GREEN}${ip}${PLAIN}"
+    echo -e " 端口   : ${GREEN}${port}${PLAIN}"
+    echo -e " 密码   : ${GREEN}${password}${PLAIN}"
+    echo -e " 证书   : ${CERT_FILE} (自签)"
+    echo -e "========================================"
+    echo -e " 快速链接 (复制到 Shadowrocket / NekoBox / v2rayN):"
+    echo -e " ${YELLOW}${link}${PLAIN}"
+    echo -e "========================================"
+    echo -e " 二维码:"
+    qrencode -t ANSIUTF8 "${link_remarks}"
+    echo -e ""
 }
 
-display_manage_commands() {
-    echo "【常用管理命令】"
-    echo "  安装/更新: sudo $0 install"
-    echo "  卸载服务  : sudo $0 uninstall"
-    echo "  启动服务  : sudo $0 start"
-    echo "  停止服务  : sudo $0 stop"
-    echo "  重启服务  : sudo $0 restart"
-    echo "  服务状态  : $0 status"
-    echo "  查看日志  : $0 log (可加参数如 -n 50)"
-    echo "  显示二维码: $0 qr"
-    echo "  查看帮助  : $0 help"
-    echo "-----------------------------------------------"
-}
+# --- 菜单管理 ---
 
-show_help_menu() {
-    echo "AnyTLS-Go 服务端管理脚本"
-    echo "用法: $0 [命令]"
+show_menu() {
+    echo -e "AnyTLS-Go 管理脚本 ${YELLOW}[v${ANYTLS_VERSION}]${PLAIN}"
+    echo "--------------------------------"
+    echo -e "1. 安装 / 更新 AnyTLS"
+    echo -e "2. 卸载 AnyTLS"
+    echo -e "3. 启动服务"
+    echo -e "4. 停止服务"
+    echo -e "5. 重启服务"
+    echo -e "6. 查看配置与二维码"
+    echo -e "7. 查看运行日志"
+    echo "--------------------------------"
+    echo -e "0. 退出脚本"
     echo ""
-    echo "可用命令:"
-    printf "  %-12s %s\n" "install" "安装或更新 AnyTLS-Go 服务 (需要sudo)"
-    printf "  %-12s %s\n" "uninstall" "卸载 AnyTLS-Go 服务 (需要sudo)"
-    printf "  %-12s %s\n" "start" "启动 AnyTLS-Go 服务 (需要sudo)"
-    printf "  %-12s %s\n" "stop" "停止 AnyTLS-Go 服务 (需要sudo)"
-    printf "  %-12s %s\n" "restart" "重启 AnyTLS-Go 服务 (需要sudo)"
-    printf "  %-12s %s\n" "status" "查看服务当前状态"
-    printf "  %-12s %s\n" "log" "实时查看服务日志 (例如: $0 log -n 100)"
-    printf "  %-12s %s\n" "qr" "重新生成并显示配置二维码 (需要输入密码)"
-    printf "  %-12s %s\n" "help" "显示此帮助菜单"
-    echo ""
-    echo "示例: sudo $0 install"
-}
+    read -p "请输入选项 [0-7]: " num
 
-
-# --- 主程序入口 ---
-main() {
-    ACTION="$1"
-    shift # Remove the first argument, so log can take its own args like -n 50
-
-    case "$ACTION" in
-        install) do_install ;;
-        uninstall) do_uninstall ;;
-        start) start_service ;;
-        stop) stop_service ;;
-        restart) restart_service ;;
-        status) status_service ;;
-        log) log_service "$@" ;; # Pass remaining arguments to log_service
-        qr) show_qr_codes_interactive ;;
-        "" | "-h" | "--help" | "help") show_help_menu ;;
-        *)
-            echo "错误: 无效的命令 '$ACTION'" >&2
-            show_help_menu
-            exit 1
-            ;;
+    case "$num" in
+        1) do_install ;;
+        2) do_uninstall ;;
+        3) systemctl start "${SERVICE_NAME}" && echo -e "${GREEN}已启动${PLAIN}" ;;
+        4) systemctl stop "${SERVICE_NAME}" && echo -e "${GREEN}已停止${PLAIN}" ;;
+        5) systemctl restart "${SERVICE_NAME}" && echo -e "${GREEN}已重启${PLAIN}" ;;
+        6) show_info ;;
+        7) journalctl -u "${SERVICE_NAME}" -f -n 50 ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}请输入正确的数字 [0-7]${PLAIN}" ;;
     esac
 }
 
-# 执行主函数，并传递所有命令行参数
-main "$@"
+# --- 入口处理 ---
+
+if [[ $# > 0 ]]; then
+    case $1 in
+        "install") do_install ;;
+        "uninstall") do_uninstall ;;
+        "info"|"qr") show_info ;;
+        "log") journalctl -u "${SERVICE_NAME}" -f ;;
+        *) show_menu ;;
+    esac
+else
+    show_menu
+fi
