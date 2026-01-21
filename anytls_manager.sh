@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # =========================================================
-# AnyTLS-Go 服务端一键管理脚本 (适配 v0.0.12+)
-# 功能: 安装/卸载/管理/二维码/自签证书自动配置
+# AnyTLS-Go 服务端一键管理脚本 (官方源修正版)
+# 适配版本: v0.0.12
+# 仓库地址: https://github.com/anytls/anytls-go
 # =========================================================
 
 # --- 全局配置 ---
-# 注意: 请确保此版本号在 GitHub Releases 中存在
-ANYTLS_VERSION="0.0.12" 
-# 项目发布地址 (根据实际情况调整，默认使用 zimolab 或官方源)
-DOWNLOAD_BASE_URL="https://github.com/zimolab/anytls-go/releases/download"
+ANYTLS_VERSION="0.0.12"
+# 修正为官方仓库地址
+DOWNLOAD_BASE_URL="https://github.com/anytls/anytls-go/releases/download"
 
 # 路径配置
 BIN_DIR="/usr/local/bin"
@@ -29,7 +29,6 @@ PLAIN="\033[0m"
 
 # --- 核心工具函数 ---
 
-# 检查是否为 Root
 check_root() {
     if [ $EUID -ne 0 ]; then
         echo -e "${RED}错误: 请使用 sudo 或 root 用户运行此脚本！${PLAIN}"
@@ -37,7 +36,6 @@ check_root() {
     fi
 }
 
-# 检查命令依赖
 check_deps() {
     local deps=("wget" "openssl" "curl" "qrencode")
     local need_install=()
@@ -63,7 +61,6 @@ check_deps() {
     fi
 }
 
-# 获取公网 IP (多接口容错)
 get_public_ip() {
     local ip=$(curl -s4m5 https://api.ipify.org)
     if [[ -z "$ip" ]]; then
@@ -81,7 +78,7 @@ do_install() {
     check_root
     check_deps
 
-    echo -e "${GREEN}>>> 开始安装 AnyTLS v${ANYTLS_VERSION}...${PLAIN}"
+    echo -e "${GREEN}>>> 开始安装 AnyTLS v${ANYTLS_VERSION} (官方源)...${PLAIN}"
 
     # 1. 架构检测
     ARCH=$(uname -m)
@@ -98,26 +95,39 @@ do_install() {
     read -p "请输入连接密码 [留空随机]: " PASSWORD
     [[ -z "${PASSWORD}" ]] && PASSWORD=$(openssl rand -base64 16)
 
-    # 3. 下载文件 (v0.0.12 通常是单二进制文件)
-    # URL 格式示例: anytls-go-linux-amd64
+    # 3. 下载文件
+    # 注意: v0.0.12 官方Release通常直接提供二进制文件: anytls-go-linux-amd64
+    # 如果下载失败，可能是官方改回了 .tar.gz 格式，这里优先尝试二进制
     DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/anytls-go-linux-${DOWNLOAD_ARCH}"
     
-    echo -e "${YELLOW}正在下载核心文件...${PLAIN}"
+    echo -e "${YELLOW}正在下载核心文件: ${DOWNLOAD_URL}${PLAIN}"
     rm -f "${SERVER_BINARY_PATH}" # 清理旧文件
+    
     wget -O "${SERVER_BINARY_PATH}" "${DOWNLOAD_URL}"
 
     if [ $? -ne 0 ]; then
-        echo -e "${RED}下载失败！请检查网络或版本号。${PLAIN}"
-        exit 1
+        echo -e "${RED}下载失败！${PLAIN}"
+        echo -e "${YELLOW}尝试下载 tar.gz 格式...${PLAIN}"
+        # 备用方案：如果官方发布的是 tar.gz 包
+        wget -O "/tmp/anytls.tar.gz" "${DOWNLOAD_BASE_URL}/v${ANYTLS_VERSION}/anytls-go_${ANYTLS_VERSION}_linux_${DOWNLOAD_ARCH}.tar.gz"
+        if [ $? -eq 0 ]; then
+             tar -zxvf "/tmp/anytls.tar.gz" -C "/tmp/" anytls-go
+             mv "/tmp/anytls-go" "${SERVER_BINARY_PATH}"
+             rm "/tmp/anytls.tar.gz"
+        else
+             echo -e "${RED}无法下载文件，请检查 GitHub 连接或版本号。${PLAIN}"
+             exit 1
+        fi
     fi
+    
     chmod +x "${SERVER_BINARY_PATH}"
+    echo -e "${GREEN}核心文件安装成功。${PLAIN}"
 
     # 4. 生成证书 (v0.0.12 必需)
     mkdir -p "${CONFIG_DIR}"
     if [[ ! -f "${CERT_FILE}" ]]; then
-        echo -e "${YELLOW}正在生成自签名证书...${PLAIN}"
-        # 生成有效期 10 年的自签证书，CN 设为常见域名混淆
-        openssl req -newkey rsa:2048 -nodes -keyout "${KEY_FILE}" -x509 -days 3650 -out "${CERT_FILE}" -subj "/CN=www.microsoft.com" 2>/dev/null
+        echo -e "${YELLOW}正在生成自签名证书 (CN=www.bing.com)...${PLAIN}"
+        openssl req -newkey rsa:2048 -nodes -keyout "${KEY_FILE}" -x509 -days 3650 -out "${CERT_FILE}" -subj "/CN=www.bing.com" 2>/dev/null
     else
         echo -e "${GREEN}检测到已有证书，保留原配置。${PLAIN}"
     fi
@@ -131,7 +141,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-# 关键改动: 增加 -c 和 -k 参数加载证书
+# v0.0.12 必须指定证书 (-c) 和私钥 (-k)
 ExecStart=${SERVER_BINARY_PATH} -l :${PORT} -p "${PASSWORD}" -c ${CERT_FILE} -k ${KEY_FILE}
 Restart=on-failure
 RestartSec=5s
@@ -150,33 +160,30 @@ EOF
     if systemctl is-active --quiet "${SERVICE_NAME}"; then
         show_info "${PORT}" "${PASSWORD}"
     else
-        echo -e "${RED}服务启动失败！请运行 'journalctl -u ${SERVICE_NAME} -n 20' 查看日志。${PLAIN}"
+        echo -e "${RED}服务启动失败！${PLAIN}"
+        echo -e "请运行以下命令查看详细错误日志："
+        echo -e "${YELLOW}journalctl -u ${SERVICE_NAME} -n 20 --no-pager${PLAIN}"
     fi
 }
 
 do_uninstall() {
     check_root
     echo -e "${YELLOW}正在卸载 AnyTLS...${PLAIN}"
-    systemctl stop "${SERVICE_NAME}"
-    systemctl disable "${SERVICE_NAME}"
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null
     rm -f "${SERVICE_FILE}"
     rm -f "${SERVER_BINARY_PATH}"
-    # 可选：询问是否保留配置文件
-    # rm -rf "${CONFIG_DIR}" 
     systemctl daemon-reload
-    echo -e "${GREEN}卸载完成。${PLAIN}"
+    echo -e "${GREEN}卸载完成。(配置文件保留在 ${CONFIG_DIR})${PLAIN}"
 }
 
 show_info() {
     local port=$1
     local password=$2
     
-    # 如果没传参数，尝试从运行中的进程或配置里读 (简化处理，若未传则提示手动查看)
     if [[ -z "$port" ]]; then
-        # 尝试从 systemd 文件解析
         if [[ -f "$SERVICE_FILE" ]]; then
             port=$(grep -oP ' -l :\K\d+' "$SERVICE_FILE")
-            # 提取引号内的密码
             password=$(grep -oP ' -p "\K[^"]+' "$SERVICE_FILE")
         else
             echo -e "${RED}未找到安装配置。${PLAIN}"
@@ -185,24 +192,23 @@ show_info() {
     fi
 
     local ip=$(get_public_ip)
-    # v0.0.12 标准链接格式
+    # v0.0.12 标准链接格式 anytls://密码@IP:端口
     local link="anytls://${password}@${ip}:${port}"
-    # 兼容 Shadowrocket/NekoBox 的备注
     local link_remarks="${link}#AnyTLS_${port}"
 
     echo -e ""
     echo -e "========================================"
-    echo -e "       AnyTLS v${ANYTLS_VERSION} 配置信息"
+    echo -e "       AnyTLS v${ANYTLS_VERSION} 安装成功"
     echo -e "========================================"
     echo -e " IP地址 : ${GREEN}${ip}${PLAIN}"
     echo -e " 端口   : ${GREEN}${port}${PLAIN}"
     echo -e " 密码   : ${GREEN}${password}${PLAIN}"
     echo -e " 证书   : ${CERT_FILE} (自签)"
     echo -e "========================================"
-    echo -e " 快速链接 (复制到 Shadowrocket / NekoBox / v2rayN):"
+    echo -e " 客户端配置链接 (复制):"
     echo -e " ${YELLOW}${link}${PLAIN}"
     echo -e "========================================"
-    echo -e " 二维码:"
+    echo -e " 二维码 (Shadowrocket / NekoBox):"
     qrencode -t ANSIUTF8 "${link_remarks}"
     echo -e ""
 }
@@ -210,9 +216,9 @@ show_info() {
 # --- 菜单管理 ---
 
 show_menu() {
-    echo -e "AnyTLS-Go 管理脚本 ${YELLOW}[v${ANYTLS_VERSION}]${PLAIN}"
+    echo -e "AnyTLS-Go 管理脚本 (Official Repo)"
     echo "--------------------------------"
-    echo -e "1. 安装 / 更新 AnyTLS"
+    echo -e "1. 安装 / 更新 AnyTLS (v${ANYTLS_VERSION})"
     echo -e "2. 卸载 AnyTLS"
     echo -e "3. 启动服务"
     echo -e "4. 停止服务"
@@ -220,7 +226,7 @@ show_menu() {
     echo -e "6. 查看配置与二维码"
     echo -e "7. 查看运行日志"
     echo "--------------------------------"
-    echo -e "0. 退出脚本"
+    echo -e "0. 退出"
     echo ""
     read -p "请输入选项 [0-7]: " num
 
@@ -233,11 +239,11 @@ show_menu() {
         6) show_info ;;
         7) journalctl -u "${SERVICE_NAME}" -f -n 50 ;;
         0) exit 0 ;;
-        *) echo -e "${RED}请输入正确的数字 [0-7]${PLAIN}" ;;
+        *) echo -e "${RED}无效选项${PLAIN}" ;;
     esac
 }
 
-# --- 入口处理 ---
+# --- 入口 ---
 
 if [[ $# > 0 ]]; then
     case $1 in
